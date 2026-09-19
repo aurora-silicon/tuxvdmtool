@@ -11,8 +11,8 @@ pub mod sysfs;
 
 #[cfg(target_os = "linux")]
 use crate::sysfs::{
-    get_i2c_dev_from_typec_port, get_typec_port_from_connector, recover_missing_partner,
-    recover_vdm_timeout,
+    get_i2c_dev_from_typec_port, get_typec_port_from_connector, recover_debugusb_enumeration,
+    recover_missing_partner, recover_vdm_timeout, wait_for_debugusb,
 };
 use env_logger::Env;
 use log::{error, info, warn};
@@ -31,6 +31,7 @@ enum Error {
     ControllerTimeout,
     VdmReplyTimeout,
     VdmRejected,
+    DebugUsbEnumerationTimeout,
     I2C,
     Io(std::io::Error),
     Utf8(std::str::Utf8Error),
@@ -92,6 +93,28 @@ fn execute_command(
         _ => {}
     }
     Ok(())
+}
+
+fn execute_debugusb(bus: &str, addr: u16, code: &str) -> Result<()> {
+    let bus_dev = Box::new(i2c::I2CBusDevice::open(bus, addr)?);
+    let mut device = cd321x::Device::new(bus_dev, code.to_string())?;
+    device.debugusb()
+}
+
+fn is_debugusb_command(matches: &clap::ArgMatches) -> bool {
+    match matches.subcommand() {
+        Some(("debugusb", _)) | Some(("reboot debugusb", _)) => true,
+        Some(("reboot", args)) => args.subcommand_name() == Some("debugusb"),
+        _ => false,
+    }
+}
+
+fn is_reboot_debugusb_command(matches: &clap::ArgMatches) -> bool {
+    match matches.subcommand() {
+        Some(("reboot debugusb", _)) => true,
+        Some(("reboot", args)) => args.subcommand_name() == Some("debugusb"),
+        _ => false,
+    }
 }
 
 fn vdmtool() -> Result<()> {
@@ -168,21 +191,51 @@ fn vdmtool() -> Result<()> {
     let code = device.to_uppercase();
     let reset_controller = matches.subcommand_name() == Some("reset-controller");
     let nop = matches.subcommand_name() == Some("nop");
+    let debugusb = is_debugusb_command(&matches);
+    let reboot_debugusb = is_reboot_debugusb_command(&matches);
     #[cfg(target_os = "linux")]
     if !reset_controller && !nop {
         recover_missing_partner(&bus, addr)?;
     }
 
-    let result = execute_command(&matches, &bus, addr, &code, reset_controller);
+    let mut result = execute_command(&matches, &bus, addr, &code, reset_controller);
     if matches!(&result, Err(Error::VdmReplyTimeout)) && !reset_controller && !nop {
         #[cfg(target_os = "linux")]
         {
             recover_vdm_timeout(&bus, addr)?;
-            warn!("Retrying command once after HPM recovery");
-            return execute_command(&matches, &bus, addr, &code, false);
+            result = if reboot_debugusb {
+                warn!("The target reboot was already attempted; retrying only the DebugUSB arm");
+                execute_debugusb(&bus, addr, &code)
+            } else {
+                warn!("Retrying command once after HPM recovery");
+                execute_command(&matches, &bus, addr, &code, false)
+            };
         }
     }
-    result
+    result?;
+
+    #[cfg(target_os = "linux")]
+    if debugusb {
+        if let Some(device) = wait_for_debugusb()? {
+            info!("DebugUSB enumerated at {}", device.display());
+            return Ok(());
+        }
+
+        warn!("DebugUSB VDM was acknowledged, but no USB device enumerated");
+        recover_debugusb_enumeration(&bus, addr)?;
+        warn!("Retrying only the DebugUSB arm after exact-port recovery");
+        execute_debugusb(&bus, addr, &code)?;
+
+        if let Some(device) = wait_for_debugusb()? {
+            info!("DebugUSB enumerated at {} after recovery", device.display());
+            return Ok(());
+        }
+
+        error!("DebugUSB never enumerated after an acknowledged VDM and one scoped recovery");
+        return Err(Error::DebugUsbEnumerationTimeout);
+    }
+
+    Ok(())
 }
 
 fn main() -> ExitCode {

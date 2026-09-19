@@ -44,14 +44,24 @@ OPTIONS:
     -V, --version                 Print version information
 
 SUBCOMMANDS:
+    debugusb         enter Debug USB mode on the target
     dfu              put the target into DFU mode
     help             Print this message or the help of the given subcommand(s)
     nop              Do nothing
     reboot           reboot the target
+    reboot debugusb  reboot the target and enter Debug USB mode
     reboot serial    reboot the target and enter serial mode
+    reset-controller soft-reset only the selected host USB-C PD controller
     serial           enter serial mode on both ends
 ```
 
 Use `/dev/ttySAC0` on the local machine as your serial device. To use it with m1n1, `export M1N1DEVICE=/dev/ttySAC0`.
 
 For typical development, the command you want to use is `tuxvdmtool reboot serial`. This will reboot the target, and immediately put it back into serial mode, with the right timing to make it work.
+
+For DebugUSB/KIS, use `tuxvdmtool reboot debugusb`. On Linux, success means the
+Apple Debug USB device (`05ac:1881`) actually appeared in sysfs; a PD-level VDM
+acknowledgement alone is not considered success. If Linux has stale Type-C
+state, tuxvdmtool reprobes only the selected HPM and retries the DebugUSB arm
+once. It does not reset the host USB controller or reboot the target a second
+time.

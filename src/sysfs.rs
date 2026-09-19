@@ -12,6 +12,45 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
+const DEBUGUSB_WAIT: Duration = Duration::from_secs(8);
+const DEBUGUSB_POLL: Duration = Duration::from_millis(100);
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+fn debugusb_device_in(root: &Path) -> Result<Option<PathBuf>> {
+    for entry in fs::read_dir(root).map_err(Error::Io)? {
+        let path = entry.map_err(Error::Io)?.path();
+        if read_trimmed(&path.join("idVendor")).as_deref() != Some("05ac")
+            || read_trimmed(&path.join("idProduct")).as_deref() != Some("1881")
+        {
+            continue;
+        }
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+/// Wait for the KIS/DebugUSB function that kisd can actually open.
+///
+/// Do not try to identify a new enumeration by bus path or `devnum`: when the
+/// Apple DWC3 host is rebuilt for the Type-C reconnect, Linux legitimately
+/// reuses both values.  The command has already completed by the time this is
+/// called, so the exact KIS VID:PID being present is the useful contract.
+pub(crate) fn wait_for_debugusb() -> Result<Option<PathBuf>> {
+    let start = Instant::now();
+    while start.elapsed() < DEBUGUSB_WAIT {
+        if let Some(device) = debugusb_device_in(Path::new("/sys/bus/usb/devices"))? {
+            return Ok(Some(device));
+        }
+        thread::sleep(DEBUGUSB_POLL);
+    }
+    Ok(None)
+}
+
 pub(crate) fn get_i2c_dev_from_typec_port(typec_path: &Path) -> Option<(String, u16)> {
     let path = std::fs::canonicalize(typec_path.join("device")).ok()?;
 
@@ -155,4 +194,42 @@ pub(crate) fn recover_missing_partner(bus: &str, addr: u16) -> Result<()> {
 pub(crate) fn recover_vdm_timeout(bus: &str, addr: u16) -> Result<()> {
     warn!("VDM received no reply; resynchronizing the selected HPM before one retry");
     reprobe_hpm(bus, addr)
+}
+
+pub(crate) fn recover_debugusb_enumeration(bus: &str, addr: u16) -> Result<()> {
+    warn!("Recovering only the selected Type-C path before the DebugUSB retry");
+    reprobe_hpm(bus, addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn finds_only_the_debugusb_vid_pid() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tuxvdmtool-usb-{nonce}"));
+        let debugusb = root.join("1-1");
+        let other = root.join("1-2");
+        fs::create_dir_all(&debugusb).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(debugusb.join("idVendor"), "05ac\n").unwrap();
+        fs::write(debugusb.join("idProduct"), "1881\n").unwrap();
+        fs::write(debugusb.join("devnum"), "2\n").unwrap();
+        fs::write(other.join("idVendor"), "05ac\n").unwrap();
+        fs::write(other.join("idProduct"), "1234\n").unwrap();
+        fs::write(other.join("devnum"), "3\n").unwrap();
+
+        let found = debugusb_device_in(&root).unwrap();
+        assert_eq!(found.as_deref(), Some(debugusb.as_path()));
+
+        fs::write(debugusb.join("idProduct"), "1880\n").unwrap();
+        assert_eq!(debugusb_device_in(&root).unwrap(), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
