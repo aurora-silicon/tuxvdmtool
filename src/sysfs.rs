@@ -21,13 +21,73 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-fn debugusb_device_in(root: &Path) -> Result<Option<PathBuf>> {
+fn read_be_u32(path: &Path) -> Option<u32> {
+    let bytes = fs::read(path).ok()?;
+    Some(u32::from_be_bytes(bytes.as_slice().try_into().ok()?))
+}
+
+fn find_node_by_phandle(root: &Path, phandle: u32) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if read_be_u32(&path.join("phandle")) == Some(phandle) {
+            return Some(path);
+        }
+        if let Some(found) = find_node_by_phandle(&path, phandle) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn usb_controller_for_hpm_in(
+    device: &Path,
+    device_tree: &Path,
+    platform_devices: &Path,
+) -> Option<PathBuf> {
+    let remote = device.join("of_node/connector/ports/port@0/endpoint/remote-endpoint");
+    let remote_phandle = read_be_u32(&remote)?;
+    let remote_node = find_node_by_phandle(device_tree, remote_phandle)?;
+    let usb_node = remote_node.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("usb@"))
+    })?;
+    let address = usb_node.file_name()?.to_str()?.strip_prefix("usb@")?;
+    fs::canonicalize(platform_devices.join(format!("{address}.usb"))).ok()
+}
+
+fn usb_controller_for_hpm(bus: &str, addr: u16) -> Option<PathBuf> {
+    let device = get_i2c_sysfs_device(bus, addr)?;
+    usb_controller_for_hpm_in(
+        &device,
+        Path::new("/sys/firmware/devicetree/base"),
+        Path::new("/sys/bus/platform/devices"),
+    )
+}
+
+fn debugusb_device_in(root: &Path, controller: Option<&Path>) -> Result<Option<PathBuf>> {
     for entry in fs::read_dir(root).map_err(Error::Io)? {
         let path = entry.map_err(Error::Io)?.path();
         if read_trimmed(&path.join("idVendor")).as_deref() != Some("05ac")
             || read_trimmed(&path.join("idProduct")).as_deref() != Some("1881")
         {
             continue;
+        }
+        if let Some(controller) = controller {
+            let Ok(device_path) = fs::canonicalize(&path) else {
+                continue;
+            };
+            if !device_path.starts_with(controller) {
+                continue;
+            }
         }
         return Ok(Some(path));
     }
@@ -40,10 +100,22 @@ fn debugusb_device_in(root: &Path) -> Result<Option<PathBuf>> {
 /// Apple DWC3 host is rebuilt for the Type-C reconnect, Linux legitimately
 /// reuses both values.  The command has already completed by the time this is
 /// called, so the exact KIS VID:PID being present is the useful contract.
-pub(crate) fn wait_for_debugusb() -> Result<Option<PathBuf>> {
+pub(crate) fn wait_for_debugusb(bus: &str, addr: u16) -> Result<Option<PathBuf>> {
+    let controller = usb_controller_for_hpm(bus, addr);
+    if let Some(controller) = &controller {
+        debug!(
+            "Verifying DebugUSB below selected controller {}",
+            controller.display()
+        );
+    } else {
+        warn!("Could not map the selected HPM to a USB controller; using global DebugUSB scan");
+    }
+
     let start = Instant::now();
     while start.elapsed() < DEBUGUSB_WAIT {
-        if let Some(device) = debugusb_device_in(Path::new("/sys/bus/usb/devices"))? {
+        if let Some(device) =
+            debugusb_device_in(Path::new("/sys/bus/usb/devices"), controller.as_deref())?
+        {
             return Ok(Some(device));
         }
         thread::sleep(DEBUGUSB_POLL);
@@ -224,11 +296,37 @@ mod tests {
         fs::write(other.join("idProduct"), "1234\n").unwrap();
         fs::write(other.join("devnum"), "3\n").unwrap();
 
-        let found = debugusb_device_in(&root).unwrap();
+        let found = debugusb_device_in(&root, None).unwrap();
         assert_eq!(found.as_deref(), Some(debugusb.as_path()));
 
         fs::write(debugusb.join("idProduct"), "1880\n").unwrap();
-        assert_eq!(debugusb_device_in(&root).unwrap(), None);
+        assert_eq!(debugusb_device_in(&root, None).unwrap(), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maps_an_hpm_usb2_endpoint_to_its_platform_controller() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tuxvdmtool-dt-{nonce}"));
+        let device = root.join("i2c/0-003f");
+        let remote = device.join("of_node/connector/ports/port@0/endpoint");
+        let endpoint = root.join("dt/soc/usb@b02280000/ports/port@0/endpoint");
+        let platform = root.join("platform");
+        let controller = platform.join("b02280000.usb");
+        fs::create_dir_all(&remote).unwrap();
+        fs::create_dir_all(&endpoint).unwrap();
+        fs::create_dir_all(&controller).unwrap();
+        fs::write(remote.join("remote-endpoint"), 0x59_u32.to_be_bytes()).unwrap();
+        fs::write(endpoint.join("phandle"), 0x59_u32.to_be_bytes()).unwrap();
+
+        assert_eq!(
+            usb_controller_for_hpm_in(&device, &root.join("dt"), &platform),
+            Some(fs::canonicalize(&controller).unwrap())
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

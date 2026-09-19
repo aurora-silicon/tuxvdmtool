@@ -216,7 +216,7 @@ fn vdmtool() -> Result<()> {
 
     #[cfg(target_os = "linux")]
     if debugusb {
-        if let Some(device) = wait_for_debugusb()? {
+        if let Some(device) = wait_for_debugusb(&bus, addr)? {
             info!("DebugUSB enumerated at {}", device.display());
             return Ok(());
         }
@@ -226,7 +226,7 @@ fn vdmtool() -> Result<()> {
         warn!("Retrying only the DebugUSB arm after exact-port recovery");
         execute_debugusb(&bus, addr, &code)?;
 
-        if let Some(device) = wait_for_debugusb()? {
+        if let Some(device) = wait_for_debugusb(&bus, addr)? {
             info!("DebugUSB enumerated at {} after recovery", device.display());
             return Ok(());
         }
