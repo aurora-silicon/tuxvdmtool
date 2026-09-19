@@ -4,9 +4,11 @@
  * Copyright The Asahi Linux Contributors
  */
 
-use log::debug;
+use log::{debug, info, warn};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
@@ -68,4 +70,89 @@ pub(crate) fn get_typec_port_from_connector(connector: &str) -> Result<PathBuf> 
     }
 
     candidate.ok_or(Error::DeviceNotFound)
+}
+
+fn get_i2c_sysfs_device(bus: &str, addr: u16) -> Option<PathBuf> {
+    let bus = Path::new(bus).file_name()?.to_str()?.strip_prefix("i2c-")?;
+    Some(PathBuf::from(format!(
+        "/sys/bus/i2c/devices/{bus}-{addr:04x}"
+    )))
+}
+
+fn has_typec_partner(device: &Path) -> bool {
+    let Ok(ports) = fs::read_dir(device.join("typec")) else {
+        return false;
+    };
+
+    ports.filter_map(|entry| entry.ok()).any(|port| {
+        let Ok(children) = fs::read_dir(port.path()) else {
+            return false;
+        };
+        children.filter_map(|entry| entry.ok()).any(|child| {
+            child
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with("-partner"))
+        })
+    })
+}
+
+/// Recover a stale Linux Type-C view before touching an HPM through raw I2C.
+///
+/// tuxvdmtool has to force-open an HPM that is owned by tps6598x. If Linux
+/// misses a target reconnect while the HPM is in DBMa mode, the physical PD
+/// contract can exist while the kernel has no Type-C partner. Rebinding only
+/// the selected HPM makes tps6598x reread the live contract; it does not reset
+/// or unbind the host USB controller.
+fn reprobe_hpm(bus: &str, addr: u16) -> Result<()> {
+    let Some(device) = get_i2c_sysfs_device(bus, addr) else {
+        return Ok(());
+    };
+    if !device.exists() {
+        return Ok(());
+    }
+
+    let device_id = device
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(Error::DeviceNotFound)?;
+    let driver = fs::canonicalize(device.join("driver")).map_err(Error::Io)?;
+    if driver.file_name().and_then(|name| name.to_str()) != Some("tps6598x") {
+        warn!("Selected I2C device has no tps6598x driver; skipping Type-C recovery");
+        return Ok(());
+    }
+
+    warn!("Reprobeing only HPM {device_id}");
+    fs::write(driver.join("unbind"), device_id).map_err(Error::Io)?;
+    thread::sleep(Duration::from_millis(250));
+    fs::write(driver.join("bind"), device_id).map_err(Error::Io)?;
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        if has_typec_partner(&device) {
+            info!("Type-C partner recovered on HPM {device_id}");
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    warn!("HPM {device_id} reprobed, but no Type-C partner appeared");
+    Ok(())
+}
+
+pub(crate) fn recover_missing_partner(bus: &str, addr: u16) -> Result<()> {
+    let Some(device) = get_i2c_sysfs_device(bus, addr) else {
+        return Ok(());
+    };
+    if !device.exists() || has_typec_partner(&device) {
+        return Ok(());
+    }
+
+    warn!("Type-C partner is missing in Linux; recovering the selected HPM");
+    reprobe_hpm(bus, addr)
+}
+
+pub(crate) fn recover_vdm_timeout(bus: &str, addr: u16) -> Result<()> {
+    warn!("VDM received no reply; resynchronizing the selected HPM before one retry");
+    reprobe_hpm(bus, addr)
 }

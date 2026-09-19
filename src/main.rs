@@ -10,9 +10,12 @@ pub mod i2c;
 pub mod sysfs;
 
 #[cfg(target_os = "linux")]
-use crate::sysfs::{get_i2c_dev_from_typec_port, get_typec_port_from_connector};
+use crate::sysfs::{
+    get_i2c_dev_from_typec_port, get_typec_port_from_connector, recover_missing_partner,
+    recover_vdm_timeout,
+};
 use env_logger::Env;
-use log::{error, info};
+use log::{error, info, warn};
 use std::{fs, process::ExitCode};
 
 #[derive(Debug)]
@@ -26,6 +29,8 @@ enum Error {
     InvalidArgument,
     ReconnectTimeout,
     ControllerTimeout,
+    VdmReplyTimeout,
+    VdmRejected,
     I2C,
     Io(std::io::Error),
     Utf8(std::str::Utf8Error),
@@ -37,6 +42,56 @@ type Result<T> = std::result::Result<T, Error>;
 #[cfg(not(target_os = "linux"))]
 fn get_typec_dev_fromconnector(&connector: str) -> Result<(String, u16)> {
     Err(Error::DeviceNotFound)
+}
+
+fn execute_command(
+    matches: &clap::ArgMatches,
+    bus: &str,
+    addr: u16,
+    code: &str,
+    reset_controller: bool,
+) -> Result<()> {
+    let bus_dev = Box::new(i2c::I2CBusDevice::open(bus, addr)?);
+    let mut device = if reset_controller {
+        cd321x::Device::new_for_reset(bus_dev, code.to_string())
+    } else {
+        cd321x::Device::new(bus_dev, code.to_string())?
+    };
+
+    match matches.subcommand() {
+        Some(("dfu", _)) => {
+            device.dfu()?;
+        }
+        Some(("reboot", args)) => match args.subcommand() {
+            Some(("serial", _)) => {
+                device.reboot_wait()?;
+                device.serial()?;
+            }
+            Some(("debugusb", _)) => {
+                device.reboot_wait()?;
+                device.debugusb()?;
+            }
+            None => {
+                device.reboot()?;
+            }
+            _ => {}
+        },
+        Some(("nop", _)) => {}
+        Some(("serial", _)) => {
+            device.serial()?;
+        }
+        Some(("debugusb", _)) => {
+            device.debugusb()?;
+        }
+        Some(("disconnect", _)) => {
+            device.disconnect()?;
+        }
+        Some(("reset-controller", _)) => {
+            device.reset_controller_nowait()?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn vdmtool() -> Result<()> {
@@ -73,6 +128,10 @@ fn vdmtool() -> Result<()> {
         .subcommand(clap::Command::new("debugusb").about("enter Debug USB mode on target"))
         .subcommand(clap::Command::new("dfu").about("put the target into DFU mode"))
         .subcommand(clap::Command::new("disconnect").about("Simulate USB unplug/plug"))
+        .subcommand(
+            clap::Command::new("reset-controller")
+                .about("Soft-reset only the selected host USB-C PD controller"),
+        )
         .subcommand(clap::Command::new("nop").about("Do nothing"))
         .arg_required_else_help(true)
         .get_matches();
@@ -107,40 +166,23 @@ fn vdmtool() -> Result<()> {
     info!("Using I2C bus:{bus} address:{addr:#x}");
 
     let code = device.to_uppercase();
-    let bus_dev = Box::new(i2c::I2CBusDevice::open(&bus, addr)?);
-    let mut device = cd321x::Device::new(bus_dev, code)?;
-
-    match matches.subcommand() {
-        Some(("dfu", _)) => {
-            device.dfu()?;
-        }
-        Some(("reboot", args)) => match args.subcommand() {
-            Some(("serial", _)) => {
-                device.reboot_wait()?;
-                device.serial()?;
-            }
-            Some(("debugusb", _)) => {
-                device.reboot_wait()?;
-                device.debugusb()?;
-            }
-            None => {
-                device.reboot()?;
-            }
-            _ => {}
-        },
-        Some(("nop", _)) => {}
-        Some(("serial", _)) => {
-            device.serial()?;
-        }
-        Some(("debugusb", _)) => {
-            device.debugusb()?;
-        }
-        Some(("disconnect", _)) => {
-            device.disconnect()?;
-        }
-        _ => {}
+    let reset_controller = matches.subcommand_name() == Some("reset-controller");
+    let nop = matches.subcommand_name() == Some("nop");
+    #[cfg(target_os = "linux")]
+    if !reset_controller && !nop {
+        recover_missing_partner(&bus, addr)?;
     }
-    Ok(())
+
+    let result = execute_command(&matches, &bus, addr, &code, reset_controller);
+    if matches!(&result, Err(Error::VdmReplyTimeout)) && !reset_controller && !nop {
+        #[cfg(target_os = "linux")]
+        {
+            recover_vdm_timeout(&bus, addr)?;
+            warn!("Retrying command once after HPM recovery");
+            return execute_command(&matches, &bus, addr, &code, false);
+        }
+    }
+    result
 }
 
 fn main() -> ExitCode {
