@@ -31,6 +31,15 @@ Use `grep -a 'USB-C ' /sys/class/i2c-dev/i2c-?/device/*/of_node/connector/label`
 
 Run it as root (`sudo ./tuxvdmtool`).
 
+On hosts whose USB-C controllers are not on i2c (SN201202x on SPMI, M3 and later), tuxvdmtool
+uses the kernel tipd driver's debugfs interface, `/sys/kernel/debug/usb/tipd/<device>/{command,regs}`,
+which needs a kernel with that interface. `--connector` selects it when the connector's controller is
+not an i2c device. Without `--connector`, `--bus` or `--address`, it is used automatically if no CD321x
+exists on i2c and exactly one controller offers the interface; tuxvdmtool never falls back to
+`/dev/i2c-0` there. A controller that is already in DBMa mode (for example because the boot loader
+keeps Apple Debug USB armed on it) is used as it is and left in DBMa. `reset-controller` needs raw
+register writes and is not available through the kernel interface.
+
 ```
 USAGE:
     linuxvdmtool [OPTIONS] [SUBCOMMAND]

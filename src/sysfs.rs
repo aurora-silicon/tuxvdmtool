@@ -51,8 +51,12 @@ fn usb_controller_for_hpm_in(
     device_tree: &Path,
     platform_devices: &Path,
 ) -> Option<PathBuf> {
-    let remote = device.join("of_node/connector/ports/port@0/endpoint/remote-endpoint");
-    let remote_phandle = read_be_u32(&remote)?;
+    // The USB 2.0 endpoint is port@0 of a "ports" node, or the only "port" node of a
+    // connector that has nothing else (e.g. J700's "USB-C Left-front").
+    let connector = device.join("of_node/connector");
+    let remote_phandle = ["ports/port@0", "port"]
+        .iter()
+        .find_map(|port| read_be_u32(&connector.join(port).join("endpoint/remote-endpoint")))?;
     let remote_node = find_node_by_phandle(device_tree, remote_phandle)?;
     let usb_node = remote_node.ancestors().find(|ancestor| {
         ancestor
@@ -64,10 +68,9 @@ fn usb_controller_for_hpm_in(
     fs::canonicalize(platform_devices.join(format!("{address}.usb"))).ok()
 }
 
-fn usb_controller_for_hpm(bus: &str, addr: u16) -> Option<PathBuf> {
-    let device = get_i2c_sysfs_device(bus, addr)?;
+fn usb_controller_for_hpm(device: &Path) -> Option<PathBuf> {
     usb_controller_for_hpm_in(
-        &device,
+        device,
         Path::new("/sys/firmware/devicetree/base"),
         Path::new("/sys/bus/platform/devices"),
     )
@@ -100,8 +103,8 @@ fn debugusb_device_in(root: &Path, controller: Option<&Path>) -> Result<Option<P
 /// Apple DWC3 host is rebuilt for the Type-C reconnect, Linux legitimately
 /// reuses both values.  The command has already completed by the time this is
 /// called, so the exact KIS VID:PID being present is the useful contract.
-pub(crate) fn wait_for_debugusb(bus: &str, addr: u16) -> Result<Option<PathBuf>> {
-    let controller = usb_controller_for_hpm(bus, addr);
+pub(crate) fn wait_for_debugusb(device: &Path) -> Result<Option<PathBuf>> {
+    let controller = usb_controller_for_hpm(device);
     if let Some(controller) = &controller {
         debug!(
             "Verifying DebugUSB below selected controller {}",
@@ -123,8 +126,37 @@ pub(crate) fn wait_for_debugusb(bus: &str, addr: u16) -> Result<Option<PathBuf>>
     Ok(None)
 }
 
+/// The controller device a Type-C port belongs to, e.g.
+/// /sys/devices/platform/soc/.../spmi-0/0-0c for an SN201202x on SPMI.
+pub(crate) fn get_dev_from_typec_port(typec_path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(typec_path.join("device")).ok()
+}
+
+/// Whether any i2c device is an Apple CD321x, i.e. a controller the raw i2c
+/// transport (and its /dev/i2c-0 0x38 default) can be meant for.
+pub(crate) fn has_i2c_cd321x() -> bool {
+    has_i2c_cd321x_in(Path::new("/sys/bus/i2c/devices"))
+}
+
+fn has_i2c_cd321x_in(i2c_devices: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(i2c_devices) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        fs::read(entry.path().join("of_node/compatible"))
+            .is_ok_and(|compat| compat.split(|&b| b == 0).any(|c| c == b"apple,cd321x"))
+    })
+}
+
+/// The connector label of an HPM device, if its DT node has one.
+pub(crate) fn connector_label(device: &Path) -> Option<String> {
+    let label = fs::read(device.join("of_node/connector/label")).ok()?;
+    let label = label.split(|&b| b == 0).next()?;
+    Some(String::from_utf8_lossy(label).into_owned())
+}
+
 pub(crate) fn get_i2c_dev_from_typec_port(typec_path: &Path) -> Option<(String, u16)> {
-    let path = std::fs::canonicalize(typec_path.join("device")).ok()?;
+    let path = get_dev_from_typec_port(typec_path)?;
 
     // First, check that this device is located on an i2c bus
     let bus_id = path
@@ -183,7 +215,7 @@ pub(crate) fn get_typec_port_from_connector(connector: &str) -> Result<PathBuf> 
     candidate.ok_or(Error::DeviceNotFound)
 }
 
-fn get_i2c_sysfs_device(bus: &str, addr: u16) -> Option<PathBuf> {
+pub(crate) fn get_i2c_sysfs_device(bus: &str, addr: u16) -> Option<PathBuf> {
     let bus = Path::new(bus).file_name()?.to_str()?.strip_prefix("i2c-")?;
     Some(PathBuf::from(format!(
         "/sys/bus/i2c/devices/{bus}-{addr:04x}"
@@ -208,17 +240,20 @@ fn has_typec_partner(device: &Path) -> bool {
     })
 }
 
-/// Recover a stale Linux Type-C view before touching an HPM through raw I2C.
+/// Kernel drivers for the HPMs this tool talks to: tps6598x (i2c CD321x) and
+/// sn201202x (SPMI, M3 and later).  Both are frontends of the tipd core.
+fn is_hpm_driver(name: &str) -> bool {
+    matches!(name, "tps6598x" | "sn201202x")
+}
+
+/// Recover a stale Linux Type-C view before touching an HPM.
 ///
-/// tuxvdmtool has to force-open an HPM that is owned by tps6598x. If Linux
-/// misses a target reconnect while the HPM is in DBMa mode, the physical PD
-/// contract can exist while the kernel has no Type-C partner. Rebinding only
-/// the selected HPM makes tps6598x reread the live contract; it does not reset
-/// or unbind the host USB controller.
-fn reprobe_hpm(bus: &str, addr: u16) -> Result<()> {
-    let Some(device) = get_i2c_sysfs_device(bus, addr) else {
-        return Ok(());
-    };
+/// With raw I2C, tuxvdmtool has to force-open an HPM that is owned by tps6598x.
+/// If Linux misses a target reconnect while the HPM is in DBMa mode, the
+/// physical PD contract can exist while the kernel has no Type-C partner.
+/// Rebinding only the selected HPM makes the tipd driver reread the live
+/// contract; it does not reset or unbind the host USB controller.
+fn reprobe_hpm(device: &Path) -> Result<()> {
     if !device.exists() {
         return Ok(());
     }
@@ -227,9 +262,18 @@ fn reprobe_hpm(bus: &str, addr: u16) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(Error::DeviceNotFound)?;
-    let driver = fs::canonicalize(device.join("driver")).map_err(Error::Io)?;
-    if driver.file_name().and_then(|name| name.to_str()) != Some("tps6598x") {
-        warn!("Selected I2C device has no tps6598x driver; skipping Type-C recovery");
+    let Ok(driver) = fs::canonicalize(device.join("driver")) else {
+        warn!("Selected HPM {device_id} has no driver bound; skipping Type-C recovery");
+        return Ok(());
+    };
+    if !driver
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_hpm_driver)
+    {
+        warn!(
+            "Selected HPM {device_id} is not bound to tps6598x/sn201202x; skipping Type-C recovery"
+        );
         return Ok(());
     }
 
@@ -240,7 +284,7 @@ fn reprobe_hpm(bus: &str, addr: u16) -> Result<()> {
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
-        if has_typec_partner(&device) {
+        if has_typec_partner(device) {
             info!("Type-C partner recovered on HPM {device_id}");
             return Ok(());
         }
@@ -251,26 +295,23 @@ fn reprobe_hpm(bus: &str, addr: u16) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn recover_missing_partner(bus: &str, addr: u16) -> Result<()> {
-    let Some(device) = get_i2c_sysfs_device(bus, addr) else {
-        return Ok(());
-    };
-    if !device.exists() || has_typec_partner(&device) {
+pub(crate) fn recover_missing_partner(device: &Path) -> Result<()> {
+    if !device.exists() || has_typec_partner(device) {
         return Ok(());
     }
 
     warn!("Type-C partner is missing in Linux; recovering the selected HPM");
-    reprobe_hpm(bus, addr)
+    reprobe_hpm(device)
 }
 
-pub(crate) fn recover_vdm_timeout(bus: &str, addr: u16) -> Result<()> {
+pub(crate) fn recover_vdm_timeout(device: &Path) -> Result<()> {
     warn!("VDM received no reply; resynchronizing the selected HPM before one retry");
-    reprobe_hpm(bus, addr)
+    reprobe_hpm(device)
 }
 
-pub(crate) fn recover_debugusb_enumeration(bus: &str, addr: u16) -> Result<()> {
+pub(crate) fn recover_debugusb_enumeration(device: &Path) -> Result<()> {
     warn!("Recovering only the selected Type-C path before the DebugUSB retry");
-    reprobe_hpm(bus, addr)
+    reprobe_hpm(device)
 }
 
 #[cfg(test)]
@@ -329,5 +370,100 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maps_a_single_port_connector_to_its_platform_controller() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tuxvdmtool-dt1-{nonce}"));
+        let device = root.join("spmi/0-0a");
+        let remote = device.join("of_node/connector/port/endpoint");
+        let endpoint =
+            root.join("dt/soc/usb@40a280000/usb2-role-inputs/usb2-role-input@1/port/endpoint");
+        let platform = root.join("platform");
+        let controller = platform.join("40a280000.usb");
+        fs::create_dir_all(&remote).unwrap();
+        fs::create_dir_all(&endpoint).unwrap();
+        fs::create_dir_all(&controller).unwrap();
+        fs::write(remote.join("remote-endpoint"), 0x2a_u32.to_be_bytes()).unwrap();
+        fs::write(endpoint.join("phandle"), 0x2a_u32.to_be_bytes()).unwrap();
+        fs::write(
+            device.join("of_node/connector/label"),
+            b"USB-C Left-front\0",
+        )
+        .unwrap();
+
+        assert_eq!(
+            usb_controller_for_hpm_in(&device, &root.join("dt"), &platform),
+            Some(fs::canonicalize(&controller).unwrap())
+        );
+        assert_eq!(
+            connector_label(&device).as_deref(),
+            Some("USB-C Left-front")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_cd321x_only_by_compatible() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tuxvdmtool-i2c-{nonce}"));
+        // J700: /dev/i2c-0 carries the cs42l83 codec, not an HPM
+        let codec = root.join("0-0048/of_node");
+        fs::create_dir_all(&codec).unwrap();
+        fs::write(codec.join("compatible"), b"cirrus,cs42l83\0").unwrap();
+        assert!(!has_i2c_cd321x_in(&root));
+
+        let hpm = root.join("1-0038/of_node");
+        fs::create_dir_all(&hpm).unwrap();
+        fs::write(hpm.join("compatible"), b"apple,cd321x\0").unwrap();
+        assert!(has_i2c_cd321x_in(&root));
+        assert!(!has_i2c_cd321x_in(&root.join("missing")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maps_typec_ports_on_spmi_to_no_i2c_device() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tuxvdmtool-typec-{nonce}"));
+        let spmi_dev = root.join("devices/spmi-0/0-0c");
+        let i2c_dev = root.join("devices/i2c-1/1-0038");
+        let spmi_port = root.join("class/port0");
+        let i2c_port = root.join("class/port1");
+        for dir in [&spmi_dev, &i2c_dev, &spmi_port, &i2c_port] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&spmi_dev, spmi_port.join("device")).unwrap();
+        std::os::unix::fs::symlink(&i2c_dev, i2c_port.join("device")).unwrap();
+
+        assert_eq!(get_i2c_dev_from_typec_port(&spmi_port), None);
+        assert_eq!(
+            get_dev_from_typec_port(&spmi_port),
+            Some(fs::canonicalize(&spmi_dev).unwrap())
+        );
+        assert_eq!(
+            get_i2c_dev_from_typec_port(&i2c_port),
+            Some(("/dev/i2c-1".to_string(), 0x38))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_both_tipd_frontends_for_reprobe() {
+        assert!(is_hpm_driver("tps6598x"));
+        assert!(is_hpm_driver("sn201202x"));
+        assert!(!is_hpm_driver("cs42l83"));
     }
 }

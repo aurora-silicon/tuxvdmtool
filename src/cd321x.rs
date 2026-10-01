@@ -15,6 +15,13 @@ use std::{
 pub(crate) trait BusDevice {
     fn write_block(&mut self, reg: u8, data: &[u8]) -> Result<()>;
     fn read_block(&mut self, reg: u8, buf: &mut [u8]) -> Result<()>;
+
+    /// Run a whole 4CC command (DATA1 + CMD1 + completion) if the transport does that
+    /// itself, as the kernel tipd driver does.  `None` means the transport only moves
+    /// register contents and `Device` drives CMD1 through `read_block`/`write_block`.
+    fn exec_cmd(&mut self, _cmd_tag: &[u8; 4], _in_data: &[u8]) -> Option<Result<()>> {
+        None
+    }
 }
 
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -72,6 +79,10 @@ pub(crate) struct Device {
     bus_dev: Box<dyn BusDevice>,
     key: Vec<u8>,
     skip_shutdown: bool,
+    /// This session unlocked the controller and entered DBMa, so it has to leave
+    /// it again.  A controller found in DBMa (e.g. a boot loader keeping Apple
+    /// Debug USB armed on it) is left exactly as it was.
+    entered_dbma: bool,
 }
 
 impl Device {
@@ -80,6 +91,7 @@ impl Device {
             bus_dev,
             key: code.into_bytes().into_iter().rev().collect::<Vec<u8>>(),
             skip_shutdown: true,
+            entered_dbma: false,
         }
     }
 
@@ -88,14 +100,16 @@ impl Device {
             bus_dev,
             key: code.into_bytes().into_iter().rev().collect::<Vec<u8>>(),
             skip_shutdown: false,
+            entered_dbma: false,
         };
         match device.get_mode()? {
             TpsMode::App => {
                 device.lock(device.key.clone().as_slice())?;
+                device.entered_dbma = true;
                 device.dbma(true)?;
             }
             TpsMode::Dbma => {
-                info!("Controller already in DBMa mode; reusing active session");
+                info!("Controller already in DBMa mode; using it and leaving it in DBMa");
             }
             _ => return Err(Error::TypecController),
         }
@@ -114,6 +128,13 @@ impl Device {
         cmd_timeout: Duration,
         res_delay: Duration,
     ) -> Result<()> {
+        // A transport that executes commands itself owns CMD1 and its timeouts.
+        if let Some(result) = self.bus_dev.exec_cmd(cmd_tag, in_data) {
+            result?;
+            thread::sleep(res_delay);
+            return Ok(());
+        }
+
         // First: wait for CMD1 to become idle.  During a reconnect the PD
         // controller can still be finishing its own VDM traffic; treating
         // that normal transient as a hard error loses the early boot window.
@@ -180,7 +201,8 @@ impl Device {
     fn dbma(&mut self, debug: bool) -> Result<()> {
         let data: [u8; 1] = if debug { [1] } else { [0] };
         self.exec_cmd(b"DBMa", &data)?;
-        if self.get_mode()? != TpsMode::Dbma {
+        let expected = if debug { TpsMode::Dbma } else { TpsMode::App };
+        if self.get_mode()? != expected {
             return Err(Error::TypecController);
         }
         Ok(())
@@ -341,11 +363,86 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if self.skip_shutdown {
+        if self.skip_shutdown || !self.entered_dbma {
             return;
         }
         let lock: [u8; 4] = [0, 0, 0, 0];
         let _ = self.dbma(false);
         let _ = self.lock(&lock);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Mode = Rc<RefCell<[u8; 4]>>;
+    type CommandLog = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
+
+    /// A command-level transport (like the kernel tipd interface) that records commands
+    /// and models MODE for LOCK/DBMa.
+    struct MockBus {
+        mode: Mode,
+        log: CommandLog,
+    }
+
+    impl BusDevice for MockBus {
+        fn write_block(&mut self, _reg: u8, _data: &[u8]) -> Result<()> {
+            Err(Error::FeatureMissing)
+        }
+
+        fn read_block(&mut self, reg: u8, buf: &mut [u8]) -> Result<()> {
+            buf.fill(0);
+            if reg == TPS_REG_MODE {
+                buf.copy_from_slice(&*self.mode.borrow());
+            }
+            Ok(())
+        }
+
+        fn exec_cmd(&mut self, cmd: &[u8; 4], data: &[u8]) -> Option<Result<()>> {
+            if cmd == b"DBMa" {
+                *self.mode.borrow_mut() = if data[0] != 0 { *b"DBMa" } else { *b"APP " };
+            }
+            self.log
+                .borrow_mut()
+                .push((String::from_utf8_lossy(cmd).into_owned(), data.to_vec()));
+            Some(Ok(()))
+        }
+    }
+
+    fn session(mode: &[u8; 4]) -> (Mode, CommandLog) {
+        let mode = Rc::new(RefCell::new(*mode));
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let bus = MockBus {
+            mode: mode.clone(),
+            log: log.clone(),
+        };
+        let device = Device::new(Box::new(bus), "J700".to_string()).unwrap();
+        drop(device);
+        (mode, log)
+    }
+
+    #[test]
+    fn enters_and_leaves_dbma_from_app_mode() {
+        let (mode, log) = session(b"APP ");
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                ("LOCK".to_string(), b"007J".to_vec()),
+                ("DBMa".to_string(), vec![1]),
+                ("DBMa".to_string(), vec![0]),
+                ("LOCK".to_string(), vec![0, 0, 0, 0]),
+            ]
+        );
+        assert_eq!(&*mode.borrow(), b"APP ");
+    }
+
+    #[test]
+    fn leaves_a_controller_found_in_dbma_alone() {
+        let (mode, log) = session(b"DBMa");
+        assert!(log.borrow().is_empty());
+        assert_eq!(&*mode.borrow(), b"DBMa");
     }
 }
