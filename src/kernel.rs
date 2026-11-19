@@ -28,6 +28,12 @@ pub(crate) const TIPD_DEBUGFS_ROOT: &str = "/sys/kernel/debug/usb/tipd";
 const MAX_BLOCK: usize = 64;
 /* Same budget the register-level path gives a busy CMD1 */
 const CMD_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+/*
+ * The driver answers EBUSY at once while CMD1 still holds a command, so writing the request
+ * again is the CMD1 poll; done this way it runs under the driver's lock, which a read of CMD1
+ * through regs followed by a write would not.  Same interval as the register-level poll.
+ */
+const CMD_IDLE_POLL: Duration = Duration::from_millis(10);
 
 pub(crate) struct KernelBusDevice {
     name: String,
@@ -156,7 +162,7 @@ impl KernelBusDevice {
                         debug!("{}: CMD1 stayed busy", self.name);
                         return Err(Error::ControllerTimeout);
                     }
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(CMD_IDLE_POLL);
                 }
                 Err(err) => {
                     debug!(
