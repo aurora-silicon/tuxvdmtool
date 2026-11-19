@@ -12,8 +12,16 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
+/*
+ * Enumeration waits read sysfs state.  The uevent for the new device would only shorten a wait
+ * by up to one poll interval; what matters is the bound, after which recovery runs.
+ */
+/// How long the KIS/DebugUSB function may take to enumerate after an acknowledged VDM.
 const DEBUGUSB_WAIT: Duration = Duration::from_secs(8);
 const DEBUGUSB_POLL: Duration = Duration::from_millis(100);
+/// How long a contract still being negotiated may take to show up as a Type-C partner.
+const PARTNER_WAIT: Duration = Duration::from_secs(3);
+const PARTNER_POLL: Duration = Duration::from_millis(100);
 
 fn read_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path)
@@ -278,17 +286,25 @@ fn reprobe_hpm(device: &Path) -> Result<()> {
     }
 
     warn!("Reprobeing only HPM {device_id}");
+    /*
+     * Both writes return once the driver's remove/probe has finished, and probe registers the
+     * partner of a contract that is already up before it returns, so nothing has to settle in
+     * between.  A partner can still appear later from the controller's plug interrupt when the
+     * contract is being negotiated during the reprobe; that is what the wait below is for.
+     */
     fs::write(driver.join("unbind"), device_id).map_err(Error::Io)?;
-    thread::sleep(Duration::from_millis(250));
     fs::write(driver.join("bind"), device_id).map_err(Error::Io)?;
 
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(3) {
+    loop {
         if has_typec_partner(device) {
             info!("Type-C partner recovered on HPM {device_id}");
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        if start.elapsed() >= PARTNER_WAIT {
+            break;
+        }
+        thread::sleep(PARTNER_POLL);
     }
 
     warn!("HPM {device_id} reprobed, but no Type-C partner appeared");
