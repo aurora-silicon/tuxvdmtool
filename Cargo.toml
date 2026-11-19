@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A tool to interact with USB Type C controller chips to interact with connected Apple devices"
-repository = "https://github.com/AsahiLinux/tuxvdmtool"
+repository = "https://github.com/aurora-silicon/tuxvdmtool"
 
 [dependencies]
 clap = { version = "3", features = ["cargo"] }

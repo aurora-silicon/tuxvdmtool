@@ -4,7 +4,7 @@ This tool lets you get a serial console on an Apple Silicon device and reboot it
 
 ## Copyright
 
-This is based on [macvdmtool](https://github.com/AsahiLinux/macvdmtool) without replicating portions of [ThunderboltPatcher](https://github.com/osy/ThunderboltPatcher) and licensed under Apache-2.0.
+This is based on [macvdmtool](https://github.com/aurora-silicon/macvdmtool) without replicating portions of [ThunderboltPatcher](https://github.com/osy/ThunderboltPatcher) and licensed under Apache-2.0.
 
 * Copyright (C) 2019 osy86. All rights reserved.
 * Copyright (C) 2021 The Asahi Linux Contributors
@@ -64,7 +64,7 @@ SUBCOMMANDS:
     serial           enter serial mode on both ends
 ```
 
-Use `/dev/ttySAC0` on the local machine as your serial device. To use it with m1n1, `export M1N1DEVICE=/dev/ttySAC0`.
+Use `/dev/ttySAC0` on the local machine as your serial device. To use it with aura, `export AURADEVICE=/dev/ttySAC0`.
 
 For typical development, the command you want to use is `tuxvdmtool reboot serial`. This will reboot the target, and immediately put it back into serial mode, with the right timing to make it work.
 
