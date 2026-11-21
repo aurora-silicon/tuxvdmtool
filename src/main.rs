@@ -240,7 +240,7 @@ fn vdmtool() -> Result<()> {
                 .default_value("0x38"),
         )
         .arg(clap::arg!(-c --connector [CONNECTOR] "(Partial) connector label of the USB-C controller device."))
-        .arg(clap::arg!(--"no-retry" "Send the command once: no HPM recovery and resend when the VDM gets no reply. A reboot the target performs before it replies is otherwise sent a second time."))
+        .arg(clap::arg!(--"no-retry" "Send the command once: no HPM recovery and resend when the VDM gets no reply. A reboot the target performs before it replies is otherwise sent a second time.").action(clap::ArgAction::SetTrue))
         .subcommand(
             clap::Command::new("reboot")
                 .about("reboot the target")
