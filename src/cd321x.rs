@@ -34,6 +34,8 @@ const TPS_REG_CMD1: u8 = 0x08;
 const TPS_REG_DATA1: u8 = 0x09;
 const TPS_REG_POWER_STATUS: u8 = 0x3f;
 const TPS_REG_VDM_RX_STATUS: u8 = 0x4d;
+// 1 RX status/sequence byte + up to 7 4-byte VDOs (USB PD max VDM payload).
+const TPS_REG_VDM_RX_STATUS_LEN: usize = 1 + 7 * 4;
 
 const VDM_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -224,7 +226,7 @@ impl Device {
          * for a new reply and validate its structured-VDM header before DBMa
          * is torn down by Drop.
          */
-        let mut reply = [0u8; 64];
+        let mut reply = [0u8; TPS_REG_VDM_RX_STATUS_LEN];
         self.bus_dev.read_block(TPS_REG_VDM_RX_STATUS, &mut reply)?;
         let rx_status = reply[0];
         let data = [
@@ -386,6 +388,8 @@ mod tests {
     struct MockBus {
         mode: Mode,
         log: CommandLog,
+        vdm_rx: Rc<RefCell<[u8; TPS_REG_VDM_RX_STATUS_LEN]>>,
+        vdm_rx_reads: Rc<RefCell<Vec<usize>>>,
     }
 
     impl BusDevice for MockBus {
@@ -397,6 +401,12 @@ mod tests {
             buf.fill(0);
             if reg == TPS_REG_MODE {
                 buf.copy_from_slice(&*self.mode.borrow());
+            } else if reg == TPS_REG_VDM_RX_STATUS {
+                self.vdm_rx_reads.borrow_mut().push(buf.len());
+                if buf.len() > TPS_REG_VDM_RX_STATUS_LEN {
+                    return Err(Error::Io(std::io::Error::from_raw_os_error(5)));
+                }
+                buf.copy_from_slice(&self.vdm_rx.borrow()[..buf.len()]);
             }
             Ok(())
         }
@@ -404,6 +414,11 @@ mod tests {
         fn exec_cmd(&mut self, cmd: &[u8; 4], data: &[u8]) -> Option<Result<()>> {
             if cmd == b"DBMa" {
                 *self.mode.borrow_mut() = if data[0] != 0 { *b"DBMa" } else { *b"APP " };
+            } else if cmd == b"VDMs" && data.len() >= 5 {
+                let mut rx = self.vdm_rx.borrow_mut();
+                rx[0] = rx[0].wrapping_add(1);
+                let header = u32::from_le_bytes(data[1..5].try_into().unwrap()) | 0x40;
+                rx[1..5].copy_from_slice(&header.to_le_bytes());
             }
             self.log
                 .borrow_mut()
@@ -412,13 +427,22 @@ mod tests {
         }
     }
 
-    fn session(mode: &[u8; 4]) -> (Mode, CommandLog) {
+    fn mock_bus(mode: &[u8; 4]) -> (MockBus, Mode, CommandLog, Rc<RefCell<Vec<usize>>>) {
         let mode = Rc::new(RefCell::new(*mode));
         let log = Rc::new(RefCell::new(Vec::new()));
+        let vdm_rx = Rc::new(RefCell::new([0u8; TPS_REG_VDM_RX_STATUS_LEN]));
+        let vdm_rx_reads = Rc::new(RefCell::new(Vec::new()));
         let bus = MockBus {
             mode: mode.clone(),
             log: log.clone(),
+            vdm_rx,
+            vdm_rx_reads: vdm_rx_reads.clone(),
         };
+        (bus, mode, log, vdm_rx_reads)
+    }
+
+    fn session(mode: &[u8; 4]) -> (Mode, CommandLog) {
+        let (bus, mode, log, _) = mock_bus(mode);
         let device = Device::new(Box::new(bus), "J700".to_string()).unwrap();
         drop(device);
         (mode, log)
@@ -444,5 +468,13 @@ mod tests {
         let (mode, log) = session(b"DBMa");
         assert!(log.borrow().is_empty());
         assert_eq!(&*mode.borrow(), b"DBMa");
+    }
+
+    #[test]
+    fn vdms_reads_29_byte_rx_status_register() {
+        let (bus, _, _, vdm_rx_reads) = mock_bus(b"APP ");
+        let mut device = Device::new(Box::new(bus), "J713".to_string()).unwrap();
+        device.reboot().unwrap();
+        assert_eq!(*vdm_rx_reads.borrow(), vec![29, 29]);
     }
 }
