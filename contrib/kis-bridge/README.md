@@ -13,6 +13,7 @@ Pieces:
 | `kis-bridge` | runs kisd as a transient unit, links its pty at `/run/kis-<name>`, does the VDM sequence, catches the proxy window |
 | `kis-catch.py` | sends proxy NOPs until aura (or m1n1) answers, drops the stale replies, prints `whoami`/chip id |
 | `kis-rescue-init`, `mk-kis-rescue.sh` | a 1 MB rescue initramfs (static busybox + NVMe modules): a root shell on the console, or an unattended repair |
+| `kis-term.py` | holds a KIS pty: logs it, writes FIFO input to it, sends ESC into a hidden GRUB menu (the GRUB route) |
 | `kis-adt-node.py` | prints one ADT node through the proxy (used to find the target's DockChannel UART) |
 
 ## Install on the host
