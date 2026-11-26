@@ -75,6 +75,35 @@ serial@2e413c000 {
 };
 ```
 
+## Rescue through the Mac's own GRUB (no rescue kernel)
+
+When the Mac's own Stage 2, U-Boot, GRUB and kernel are fine and only the root file system is damaged,
+drive the normal boot chain over KIS instead of uploading a kernel. Proven on the M4 Air (J713) from an
+M4 Pro host, 2026-11-26.
+
+1. Catch the Stage 1 proxy over KIS channel 1 (`kis-bridge rescue`; release Stage 1 builds need the
+   `aura-proxy` marker on the ESP for that window).
+2. On the Stage 1 proxy: `nvme_init`, read the ANS SARTv3 entries, `nvme_shutdown`, and append
+   `nvme.sart=<entries>` to the Mac's own `aura/stage2.bin` (as Stage 1's own chainload does; without it
+   Stage 2's `nvme_init` data-aborts on a powered-off ANS).
+3. Also append `chosen.aura,serial-console=1` and `chosen.stdout-path=<path of the apple,dockchannel-uart
+   node>`. The Apple DTS sets `stdout-path = "serial0"`, which on M1-M4 laptops is the Samsung UART, so
+   keeping it (serial-console=1 alone) leaves U-Boot on a UART nobody reads. With the DockChannel path,
+   U-Boot (`CONFIG_APPLE_DOCKCHANNEL_SERIAL`) and then GRUB print on and read from KIS channel 0.
+4. `chainload.py -r --vector-only stage2-with-vars.bin`, wait on channel 1 for Stage 2's
+   `Vectoring to next stage`, then restart kisd on `--channel 0` (`kis-term.py` holds the pty, logs it,
+   takes input from a FIFO, and sends ESC once U-Boot starts the EFI binary so a hidden GRUB menu stops).
+5. In GRUB: `e` on the entry, Ctrl-N to the `linux` line, Ctrl-E, append ` console=ttyDC0 rdinit=/bin/sh`
+   (initramfs shell) or ` console=ttyDC0 rw init=/bin/bash` (root file system shell, journal readable),
+   Ctrl-X.
+
+On an SELinux root, a file or symlink made from such a shell (or from the rescue initramfs) gets no label.
+An unlabeled `/lib` symlink blocks every exec through `/lib/ld-linux-aarch64.so.1` once the system boots
+Enforcing (dbus.socket start limit, gdm/upower dependency failures, agetty `can't exec /bin/login:
+Permission denied`, no network). Copy the label of the matching `/usr` dir (`setfattr -h -n
+security.selinux -v system_u:object_r:lib_t:s0 /lib` from `init=/bin/bash`) or `touch /.autorelabel`.
+`lib-symlink-fix` now writes `/.autorelabel` when it changed anything on an SELinux root.
+
 ## What was proven, and the limits
 
 M1 Pro (fleet89, CD321x on i2c) as host, M3 Air J615 as target, cable on the host's Left Back:
@@ -95,14 +124,15 @@ M1 Pro (fleet89, CD321x on i2c) as host, M3 Air J615 as target, cable on the hos
 
 Not working yet:
 
-- The rescue initramfs has booted under QEMU only. On the J615 the boots over KIS used the system's own
-  Fedora initramfs, whose `rd.break` shell refuses a locked root account; the rescue initramfs exists to
-  avoid exactly that, but no Mac has booted it yet.
+- The rescue initramfs booted on the J713 (kboot through the proxy, root shell on ttyDC0), but a proxy kboot
+  leaves ANS powered off, so nvme-apple could not start it ('ANS did not boot'). The GRUB route above avoids
+  that; the `.autorelabel` change has not been re-run under QEMU.
 - `tuxvdmtool reboot debugusb` as one call failed on the M1 Pro -> J615 pair: the reboot VDM got no reply,
   and the retry path then armed DebugUSB on a target that had not rebooted. `kis-bridge vdm` sends `reboot`,
   then repeats `debugusb` until 05ac:1881 enumerates (up after arm 1 or 2, about 4 s).
-- An M4 Pro host (SN201202x on SPMI, the kernel tipd interface) -> M4 Air: both VDMs are acknowledged, but
-  05ac:1881 never enumerates on the host (the host xHCI restarts with every HPM recovery). Use aura's own CDC
-  gadget there (`aura-proxy` on the target's ESP: `/dev/ttyACM0`, 1209:316d).
+- An M4 Pro host (SN201202x on SPMI, the kernel tipd interface) -> M4 Air: with the cable on the Air's rear
+  port both VDMs are acknowledged but 05ac:1881 never enumerates (the host xHCI restarts with every HPM
+  recovery). On the Air's front port (its DFU port) DebugUSB came up after 1-3 arms on every attempt (10+ boots), and the
+  GRUB route above worked. Use the target's DFU port.
 - When a failed VDM sends tuxvdmtool into its HPM recovery, every USB-C partner on that HPM's controller
   restarts. If the host is powered over the tether cable, check that it is on another supply first.

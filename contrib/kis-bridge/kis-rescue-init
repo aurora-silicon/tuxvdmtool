@@ -49,7 +49,7 @@ mount_root() {
 fix_symlink() {  # name target
 	local d=/sysroot/$1 t=$2 stamp e
 	[ -L "$d" ] && { log "/$1 is already a symlink -> $(readlink "$d")"; return 0; }
-	[ -d "$d" ] || { log "/$1 is missing: creating -> $t"; ln -s "$t" "$d"; return 0; }
+	[ -d "$d" ] || { log "/$1 is missing: creating -> $t"; ln -s "$t" "$d"; CHANGED=1; return 0; }
 	stamp=$(date +%Y%m%d-%H%M%S)
 	# Keep what the tar put there: merge entries the /usr side lacks, then park the directory.
 	for e in $(cd "$d" && find . -mindepth 1 -maxdepth 2 | sort); do
@@ -58,6 +58,17 @@ fix_symlink() {  # name target
 		mv "$d/$e" "/sysroot/usr/${t#usr/}/$e" && log "moved /$1/${e#./} -> /$t/${e#./}"
 	done
 	mv "$d" "$d.bad-$stamp" && ln -s "$t" "$d" && log "/$1 -> $t restored (old dir at /$1.bad-$stamp)"
+	CHANGED=1
+}
+
+# A symlink made here has no SELinux label (no policy is loaded and busybox has no setfattr), and
+# entries moved into /usr keep the label the tar gave them. On an Enforcing root an unlabeled /lib
+# denies every exec through /lib/ld-linux-aarch64.so.1 (dbus, logind, agetty 'can't exec
+# /bin/login: Permission denied'; J713 11-26). Have the next boot relabel the root file system.
+relabel_if_selinux() {
+	[ "${CHANGED:-0}" = 1 ] || return 0
+	grep -qsE '^SELINUX=(enforcing|permissive)' /sysroot/etc/selinux/config || return 0
+	: > /sysroot/.autorelabel && log "SELinux root: /.autorelabel written (next boot relabels, then reboots once)"
 }
 
 case "$CMD" in
@@ -67,6 +78,7 @@ case "$CMD" in
 				[ -e "/sysroot/${p#*:}" ] && fix_symlink "${p%%:*}" "${p#*:}"
 			done
 			ls -ld /sysroot/lib /sysroot/lib64 /sysroot/bin /sysroot/sbin 2>/dev/null
+			relabel_if_selinux
 			cp /run/kis-rescue.log /sysroot/var/log/kis-rescue-$(date +%Y%m%d-%H%M%S).log 2>/dev/null
 			sync; umount /sysroot && log "root unmounted, synced"
 			if ! flag rescue.noreboot; then log "rebooting"; sleep 2; reboot -f; fi
