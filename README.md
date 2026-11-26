@@ -74,3 +74,7 @@ acknowledgement alone is not considered success. If Linux has stale Type-C
 state, tuxvdmtool reprobes only the selected HPM and retries the DebugUSB arm
 once. It does not reset the host USB controller or reboot the target a second
 time.
+
+For a KIS console and the aura proxy over DebugUSB from a Linux host (kisd, a
+`/run/kis-<name>` link for proxyclient, a rescue initramfs for a Mac whose Linux
+does not boot), see [`contrib/kis-bridge`](contrib/kis-bridge/README.md).

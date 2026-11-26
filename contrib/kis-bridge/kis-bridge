@@ -1,0 +1,103 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# kis-bridge: KIS/DebugUSB console + proxy bridge for a tethered Apple silicon Mac, from a Linux host.
+#
+#   kis-bridge up NAME            start kisd (unit kis-bridge-NAME) and link its pty to /run/kis-NAME
+#   kis-bridge down NAME          stop it and remove the link
+#   kis-bridge vdm CONNECTOR      reboot the target over VDM, then arm DebugUSB until 05ac:1881 enumerates
+#   kis-bridge rescue NAME CONNECTOR [catch-seconds] [attempts]
+#                                 up + vdm + catch the target's proxy window on /run/kis-NAME
+#   kis-bridge status [NAME]
+#
+# Environment: KIS_CHANNEL (kisd --channel, default 1 = the m1n1/aura UART), KIS_BASE (kisd --base,
+# default: kisd guesses), KISD (default /usr/local/bin/kisd), TUXVDMTOOL (default tuxvdmtool),
+# AURA_PROXYCLIENT (aura proxyclient dir, for the catch), KIS_PYTHON (python with pyserial), KIS_LOGDIR (default /var/log/kis-bridge).
+# kisd links its pty at /dev/m1n1 whatever the NAME, so run one bridge per host.
+set -u
+KISD=${KISD:-/usr/local/bin/kisd}
+TUXVDMTOOL=${TUXVDMTOOL:-tuxvdmtool}
+KIS_CHANNEL=${KIS_CHANNEL:-1}
+KIS_LOGDIR=${KIS_LOGDIR:-/var/log/kis-bridge}
+HERE=$(dirname "$(readlink -f "$0")")
+CATCH=${KIS_CATCH:-$HERE/kis-catch.py}
+KIS_PYTHON=${KIS_PYTHON:-python3}
+
+die() { echo "kis-bridge: $*" >&2; exit 1; }
+ts() { date +%H:%M:%S.%3N; }
+[ "$(id -u)" = 0 ] || die "run as root (kisd claims the USB interface and owns the pty)"
+
+link() {  # NAME: point /run/kis-NAME at kisd's pty
+  local n=$1 pty
+  for _ in $(seq 1 50); do pty=$(readlink /dev/m1n1 2>/dev/null) && [ -e "$pty" ] && break; sleep 0.1; done
+  [ -n "${pty:-}" ] || die "kisd did not create /dev/m1n1"
+  ln -sfn "$pty" "/run/kis-$n"; echo "$(ts) /run/kis-$n -> $pty"
+}
+
+up() {
+  local n=$1 unit=kis-bridge-$1
+  if systemctl is-active -q "$unit"; then link "$n"; return; fi
+  systemctl reset-failed "$unit" 2>/dev/null
+  local args=(--channel "$KIS_CHANNEL"); [ -n "${KIS_BASE:-}" ] && args+=(--base "$KIS_BASE")
+  rm -f /dev/m1n1
+  systemd-run -q --unit="$unit" --collect -p Restart=on-failure -E RUST_LOG=${RUST_LOG:-kisd=info} \
+    "$KISD" "${args[@]}" || die "could not start $unit"
+  link "$n"
+}
+
+down() {
+  systemctl stop "kis-bridge-$1" 2>/dev/null
+  rm -f "/run/kis-$1"; [ -e "$(readlink /dev/m1n1 2>/dev/null)" ] || rm -f /dev/m1n1
+  echo "$(ts) kis-bridge-$1 stopped"
+}
+
+debugusb_up() { lsusb -d 05ac:1881 >/dev/null 2>&1; }
+
+vdm() {  # CONNECTOR
+  local c=$1
+  # One 'reboot debugusb' call skips the reboot on its retry path and then arms a target that
+  # never rebooted; the two steps separately, the arm repeated, is what works (J615 from an M1 Pro).
+  echo "$(ts) VDM reboot ($c)"
+  timeout 20 "$TUXVDMTOOL" --connector "$c" reboot 2>&1 | grep -E 'acknowledged|ERROR' | tail -2
+  for i in $(seq 1 40); do
+    timeout 6 "$TUXVDMTOOL" --connector "$c" debugusb >/dev/null 2>&1
+    if debugusb_up; then echo "$(ts) DebugUSB up after arm $i"; return 0; fi
+    sleep 0.3
+  done
+  die "DebugUSB (05ac:1881) did not enumerate"
+}
+
+rescue() {  # NAME CONNECTOR [secs] [attempts]
+  # aura checks for a DebugUSB reader once, about 4 s into Stage 1: when kisd attaches later than
+  # that, Stage 1 boots straight through (the OS still gets the debug console). Try again then.
+  local n=$1 c=$2 secs=${3:-30} tries=${4:-3} t rc log
+  mkdir -p "$KIS_LOGDIR"
+  up "$n"
+  for t in $(seq 1 "$tries"); do
+    vdm "$c" || return 1
+    log="$KIS_LOGDIR/$n-$(date +%Y%m%d-%H%M%S)-catch.log"
+    echo "$(ts) attempt $t/$tries: catching the proxy window on /run/kis-$n (console -> $log)"
+    AURA_PROXYCLIENT=${AURA_PROXYCLIENT:-} timeout $((secs + 30)) "$KIS_PYTHON" "$CATCH" "/run/kis-$n" \
+      --seconds "$secs" --log "$log" 2>&1
+    rc=$?
+    [ $rc = 0 ] && return 0
+    echo "$(ts) attempt $t: no proxy (rc=$rc); last console lines:"
+    strings "$log" | grep -E 'window|host|Vectoring|Chainloading' | tail -3
+  done
+  die "no proxy window caught in $tries attempts"
+}
+
+status() {
+  systemctl --no-pager -l status "kis-bridge-${1:-*}" 2>/dev/null | head -12
+  ls -l /run/kis-* /dev/m1n1 2>/dev/null; lsusb -d 05ac:1881 2>/dev/null || echo "no DebugUSB device"
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  up) [ $# -ge 1 ] || die "up NAME"; up "$1" ;;
+  down) [ $# -ge 1 ] || die "down NAME"; down "$1" ;;
+  link) link "$1" ;;
+  vdm) [ $# -ge 1 ] || die "vdm CONNECTOR"; vdm "$1" ;;
+  rescue) [ $# -ge 2 ] || die "rescue NAME CONNECTOR [secs] [attempts]"; rescue "$@" ;;
+  status) status "$@" ;;
+  *) sed -n '3,16p' "$0"; exit 2 ;;
+esac
