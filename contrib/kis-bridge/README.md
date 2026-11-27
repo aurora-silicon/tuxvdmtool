@@ -35,9 +35,16 @@ a debugusb boot, Stage 1 prints `aura: debugusb boot, opening proxy window` and 
 
 ```sh
 export AURA_PROXYCLIENT=/path/to/aura/proxyclient KIS_PYTHON=python3
-sudo -E kis-bridge rescue j615 "USB-C Left Back" 30 3     # name, connector label on the HOST, catch s, attempts
+sudo -E kis-bridge rescue j615 "USB-C Left Back" "$TARGET_PD_PID" 30 3
 # -> "proxy answered 1.20 s after start", "is_kis True whoami 1 chipid 0x8122"
 ```
+
+Use the exact connector label on the host. Set `TARGET_PD_PID` to the known target's USB PD
+product ID as `0xNNNN`. With the target identified and connected, read the high 16 bits of
+`/sys/class/typec/portN-partner/identity/product`. The bridge checks the Apple vendor ID and
+that product before reboot and before each DebugUSB arm. If the partner identity is temporarily
+unavailable after reboot, it waits within the arm loop without issuing a command. The product ID
+identifies a model, so verify the physical tether when two targets have the same ID.
 
 Then boot the target's own kernel with the rescue initramfs (from its kernel package; same root as its
 normal command line):

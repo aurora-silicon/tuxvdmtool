@@ -4,8 +4,8 @@
 #
 #   kis-bridge up NAME            start kisd (unit kis-bridge-NAME) and link its pty to /run/kis-NAME
 #   kis-bridge down NAME          stop it and remove the link
-#   kis-bridge vdm CONNECTOR      reboot the target over VDM, then arm DebugUSB until 05ac:1881 enumerates
-#   kis-bridge rescue NAME CONNECTOR [catch-seconds] [attempts]
+#   kis-bridge vdm CONNECTOR PID  reboot the target over VDM, then arm DebugUSB until 05ac:1881 enumerates
+#   kis-bridge rescue NAME CONNECTOR PID [catch-seconds] [attempts]
 #                                 up + vdm + catch the target's proxy window on /run/kis-NAME
 #   kis-bridge status [NAME]
 #
@@ -52,13 +52,48 @@ down() {
 
 debugusb_up() { lsusb -d 05ac:1881 >/dev/null 2>&1; }
 
-vdm() {  # CONNECTOR
-  local c=$1
+typec_port() {
+  local connector=${1,,} port label match=
+  [[ $connector == "usb-c "* ]] || return 1
+  for port in /sys/class/typec/port*; do
+    [[ ${port##*/} =~ ^port[0-9]+$ ]] || continue
+    label=
+    IFS= read -r -d '' label < "$port/device/of_node/connector/label" 2>/dev/null || [[ -n ${label:-} ]] || continue
+    [[ ${label,,} == "$connector" ]] || continue
+    [[ -z $match ]] || return 1
+    match=$port
+  done
+  [[ -n $match ]] || return 1
+  printf '%s\n' "$match"
+}
+
+partner_matches() {
+  local identity=$1 expected=$2 header product
+  [[ -r $identity/id_header && -r $identity/product ]] || return 2
+  read -r header < "$identity/id_header" || return 2
+  read -r product < "$identity/product" || return 2
+  [[ $header =~ ^0[xX][0-9a-fA-F]{1,8}$ && $product =~ ^0[xX][0-9a-fA-F]{1,8}$ ]] || return 1
+  (( header && product )) || return 2
+  (( (header & 0xffff) == 0x05ac && ((product >> 16) & 0xffff) == expected ))
+}
+
+vdm() {  # CONNECTOR PID
+  local c=$1 pid=$2 port identity result i
+  [[ $pid =~ ^0[xX][0-9a-fA-F]{4}$ ]] && (( pid )) || die "PID must be a nonzero four-digit hexadecimal USB PD product ID (0xNNNN)"
+  port=$(typec_port "$c") || die "use the exact, unique USB-C connector label on the host"
+  identity=$port-partner/identity
+  partner_matches "$identity" "$pid" || die "cannot verify Apple partner product $pid on $c"
   # One 'reboot debugusb' call skips the reboot on its retry path and then arms a target that
   # never rebooted; the two steps separately, the arm repeated, is what works (J615 from an M1 Pro).
   echo "$(ts) VDM reboot ($c)"
   timeout 20 "$TUXVDMTOOL" --connector "$c" reboot 2>&1 | grep -E 'acknowledged|ERROR' | tail -2
   for i in $(seq 1 40); do
+    result=0
+    partner_matches "$identity" "$pid" || result=$?
+    case $result in
+      1) die "partner identity changed on $c" ;;
+      2) sleep 0.3; continue ;;
+    esac
     timeout 6 "$TUXVDMTOOL" --connector "$c" debugusb >/dev/null 2>&1
     if debugusb_up; then echo "$(ts) DebugUSB up after arm $i"; return 0; fi
     sleep 0.3
@@ -66,14 +101,14 @@ vdm() {  # CONNECTOR
   die "DebugUSB (05ac:1881) did not enumerate"
 }
 
-rescue() {  # NAME CONNECTOR [secs] [attempts]
+rescue() {  # NAME CONNECTOR PID [secs] [attempts]
   # aura checks for a DebugUSB reader once, about 4 s into Stage 1: when kisd attaches later than
   # that, Stage 1 boots straight through (the OS still gets the debug console). Try again then.
-  local n=$1 c=$2 secs=${3:-30} tries=${4:-3} t rc log
+  local n=$1 c=$2 pid=$3 secs=${4:-30} tries=${5:-3} t rc log
   mkdir -p "$KIS_LOGDIR"
   up "$n"
   for t in $(seq 1 "$tries"); do
-    vdm "$c" || return 1
+    vdm "$c" "$pid" || return 1
     log="$KIS_LOGDIR/$n-$(date +%Y%m%d-%H%M%S)-catch.log"
     echo "$(ts) attempt $t/$tries: catching the proxy window on /run/kis-$n (console -> $log)"
     AURA_PROXYCLIENT=${AURA_PROXYCLIENT:-} timeout $((secs + 30)) "$KIS_PYTHON" "$CATCH" "/run/kis-$n" \
@@ -96,8 +131,8 @@ case "$cmd" in
   up) [ $# -ge 1 ] || die "up NAME"; up "$1" ;;
   down) [ $# -ge 1 ] || die "down NAME"; down "$1" ;;
   link) link "$1" ;;
-  vdm) [ $# -ge 1 ] || die "vdm CONNECTOR"; vdm "$1" ;;
-  rescue) [ $# -ge 2 ] || die "rescue NAME CONNECTOR [secs] [attempts]"; rescue "$@" ;;
+  vdm) [ $# -eq 2 ] || die "vdm CONNECTOR PID"; vdm "$@" ;;
+  rescue) [ $# -ge 3 ] || die "rescue NAME CONNECTOR PID [secs] [attempts]"; rescue "$@" ;;
   status) status "$@" ;;
   *) sed -n '3,16p' "$0"; exit 2 ;;
 esac
