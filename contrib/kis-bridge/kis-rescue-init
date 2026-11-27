@@ -1,0 +1,89 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# kis-rescue /init: a root shell on the console plus unattended repairs, for a Mac booted over a
+# KIS bridge (console=ttyDC0). Kernel arguments:
+#   root=UUID=... rootflags=subvol=...   the installed system (the same as its normal cmdline)
+#   rescue.cmd=shell                     (default) mount nothing, give a root shell
+#   rescue.cmd=lib-symlink-fix           restore /lib -> usr/lib (and /bin, /sbin, /lib64 -> usr/...)
+#                                        when a tar replaced the symlink with a directory, then reboot
+#   rescue.cmd=mount                     mount the root at /sysroot, then give a shell
+#   rescue.noreboot                      stay in the shell after an unattended command
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin
+mount -t proc proc /proc; mount -t sysfs sysfs /sys; mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /sysroot /run; mount -t devpts devpts /dev/pts
+log() { echo "kis-rescue: $*"; echo "$(cat /proc/uptime | cut -d' ' -f1) $*" >> /run/kis-rescue.log; }
+arg() { for a in $(cat /proc/cmdline); do case "$a" in "$1"=*) echo "${a#*=}"; return 0;; esac; done; return 1; }
+flag() { grep -qw "$1" /proc/cmdline; }
+CON=/dev/console; for a in $(cat /proc/cmdline); do case "$a" in console=*) c=${a#console=}; c=${c%%,*}; [ -e /dev/$c ] && CON=/dev/$c;; esac; done
+exec >"$CON" 2>&1 <"$CON"
+log "kernel $(uname -r), console $CON"
+
+for m in nvme-keyring nvme-auth nvme-core apple-sart nvme-apple macsmc-reboot; do
+	f=$(find /lib/modules -name "$m.ko*" | head -1)
+	[ -n "$f" ] && { insmod "$f" 2>/dev/null && log "loaded $m" || log "insmod $m failed (or built in)"; }
+done
+
+CMD=$(arg rescue.cmd) || CMD=shell
+ROOT=$(arg root) || ROOT=
+SUBVOL=$(arg rootflags | sed -n 's/.*subvol=\([^,]*\).*/\1/p')
+log "rescue.cmd=$CMD root=$ROOT subvol=${SUBVOL:-<none>}"
+
+mount_root() {
+	local dev= i
+	for i in $(seq 1 60); do
+		case "$ROOT" in
+			UUID=*|LABEL=*|PARTUUID=*) dev=$(findfs "$ROOT" 2>/dev/null) ;;
+			/dev/*) [ -b "$ROOT" ] && dev=$ROOT ;;
+		esac
+		[ -n "$dev" ] && break; sleep 0.5
+	done
+	[ -n "$dev" ] || { log "root $ROOT not found"; ls /dev/nvme* 2>/dev/null; return 1; }
+	mount -t btrfs -o rw${SUBVOL:+,subvol=$SUBVOL} "$dev" /sysroot 2>/dev/null ||
+		mount -o rw "$dev" /sysroot || { log "mount $dev failed"; return 1; }
+	log "mounted $dev at /sysroot"
+}
+
+# Fedora (usrmerge): /bin /sbin /lib /lib64 are symlinks into /usr. A 'tar -C /' without
+# --keep-directory-symlink replaces one with a real directory holding only what the tar carried.
+fix_symlink() {  # name target
+	local d=/sysroot/$1 t=$2 stamp e
+	[ -L "$d" ] && { log "/$1 is already a symlink -> $(readlink "$d")"; return 0; }
+	[ -d "$d" ] || { log "/$1 is missing: creating -> $t"; ln -s "$t" "$d"; CHANGED=1; return 0; }
+	stamp=$(date +%Y%m%d-%H%M%S)
+	# Keep what the tar put there: merge entries the /usr side lacks, then park the directory.
+	for e in $(cd "$d" && find . -mindepth 1 -maxdepth 2 | sort); do
+		[ -e "/sysroot/usr/${t#usr/}/$e" ] && continue
+		mkdir -p "$(dirname "/sysroot/usr/${t#usr/}/$e")"
+		mv "$d/$e" "/sysroot/usr/${t#usr/}/$e" && log "moved /$1/${e#./} -> /$t/${e#./}"
+	done
+	mv "$d" "$d.bad-$stamp" && ln -s "$t" "$d" && log "/$1 -> $t restored (old dir at /$1.bad-$stamp)"
+	CHANGED=1
+}
+
+# A symlink made here has no SELinux label (no policy is loaded and busybox has no setfattr), and
+# entries moved into /usr keep the label the tar gave them. On an Enforcing root an unlabeled /lib
+# denies every exec through /lib/ld-linux-aarch64.so.1 (dbus, logind, agetty 'can't exec
+# /bin/login: Permission denied'; J713 11-26). Have the next boot relabel the root file system.
+relabel_if_selinux() {
+	[ "${CHANGED:-0}" = 1 ] || return 0
+	grep -qsE '^SELINUX=(enforcing|permissive)' /sysroot/etc/selinux/config || return 0
+	: > /sysroot/.autorelabel && log "SELinux root: /.autorelabel written (next boot relabels, then reboots once)"
+}
+
+case "$CMD" in
+	lib-symlink-fix)
+		if mount_root; then
+			for p in lib:usr/lib lib64:usr/lib64 bin:usr/bin sbin:usr/sbin; do
+				[ -e "/sysroot/${p#*:}" ] && fix_symlink "${p%%:*}" "${p#*:}"
+			done
+			ls -ld /sysroot/lib /sysroot/lib64 /sysroot/bin /sysroot/sbin 2>/dev/null
+			relabel_if_selinux
+			cp /run/kis-rescue.log /sysroot/var/log/kis-rescue-$(date +%Y%m%d-%H%M%S).log 2>/dev/null
+			sync; umount /sysroot && log "root unmounted, synced"
+			if ! flag rescue.noreboot; then log "rebooting"; sleep 2; reboot -f; fi
+		fi ;;
+	mount) mount_root ;;
+esac
+log "root shell on $CON (exit or 'reboot -f' to restart)"
+while :; do setsid sh -c "exec sh -i <$CON >$CON 2>&1"; done
