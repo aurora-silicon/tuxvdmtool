@@ -383,11 +383,18 @@ mod tests {
     type Mode = Rc<RefCell<[u8; 4]>>;
     type CommandLog = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
 
+    enum Reply {
+        Ack,
+        WrongHeader,
+        StaleAck,
+    }
+
     /// A command-level transport (like the kernel tipd interface) that records commands
     /// and models MODE for LOCK/DBMa.
     struct MockBus {
         mode: Mode,
         log: CommandLog,
+        reply: Reply,
         vdm_rx: Rc<RefCell<[u8; TPS_REG_VDM_RX_STATUS_LEN]>>,
         vdm_rx_reads: Rc<RefCell<Vec<usize>>>,
     }
@@ -416,9 +423,19 @@ mod tests {
                 *self.mode.borrow_mut() = if data[0] != 0 { *b"DBMa" } else { *b"APP " };
             } else if cmd == b"VDMs" && data.len() >= 5 {
                 let mut rx = self.vdm_rx.borrow_mut();
-                rx[0] = rx[0].wrapping_add(1);
-                let header = u32::from_le_bytes(data[1..5].try_into().unwrap()) | 0x40;
-                rx[1..5].copy_from_slice(&header.to_le_bytes());
+                let request = u32::from_le_bytes(data[1..5].try_into().unwrap());
+                let ack = request | 0x40;
+                match self.reply {
+                    Reply::Ack => {
+                        rx[0] = rx[0].wrapping_add(1);
+                        rx[1..5].copy_from_slice(&ack.to_le_bytes());
+                    }
+                    Reply::WrongHeader => {
+                        rx[0] = rx[0].wrapping_add(1);
+                        rx[1..5].copy_from_slice(&(ack ^ 1).to_le_bytes());
+                    }
+                    Reply::StaleAck => {}
+                }
             }
             self.log
                 .borrow_mut()
@@ -435,6 +452,7 @@ mod tests {
         let bus = MockBus {
             mode: mode.clone(),
             log: log.clone(),
+            reply: Reply::Ack,
             vdm_rx,
             vdm_rx_reads: vdm_rx_reads.clone(),
         };
@@ -476,5 +494,40 @@ mod tests {
         let mut device = Device::new(Box::new(bus), "J713".to_string()).unwrap();
         device.reboot().unwrap();
         assert_eq!(*vdm_rx_reads.borrow(), vec![29, 29]);
+    }
+
+    #[test]
+    fn vdms_accepts_ack_after_rx_sequence_wraps() {
+        let (bus, _, _, reads) = mock_bus(b"DBMa");
+        bus.vdm_rx.borrow_mut()[0] = u8::MAX;
+        let mut device = Device::new(Box::new(bus), "J713".to_string()).unwrap();
+
+        device.vdms(VdmSopType::Sop, &[0x1234_8001]).unwrap();
+        assert_eq!(*reads.borrow(), vec![29, 29]);
+    }
+
+    #[test]
+    fn vdms_rejects_a_fresh_reply_for_a_different_command() {
+        let (mut bus, _, _, _) = mock_bus(b"DBMa");
+        bus.reply = Reply::WrongHeader;
+        let mut device = Device::new(Box::new(bus), "J713".to_string()).unwrap();
+
+        assert!(matches!(
+            device.vdms(VdmSopType::Sop, &[0x1234_8001]),
+            Err(Error::VdmRejected)
+        ));
+    }
+
+    #[test]
+    fn vdms_times_out_with_an_ack_from_the_previous_exchange() {
+        let (mut bus, _, _, _) = mock_bus(b"DBMa");
+        bus.reply = Reply::StaleAck;
+        bus.vdm_rx.borrow_mut()[1..5].copy_from_slice(&0x1234_8041u32.to_le_bytes());
+        let mut device = Device::new(Box::new(bus), "J713".to_string()).unwrap();
+
+        assert!(matches!(
+            device.vdms(VdmSopType::Sop, &[0x1234_8001]),
+            Err(Error::VdmReplyTimeout)
+        ));
     }
 }
